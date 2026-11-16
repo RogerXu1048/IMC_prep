@@ -1,8 +1,0 @@
-incident_id,server,start_ts,end_ts,note
-INC-1012,srv-6,2026-11-09 09:32:00,2026-11-09 09:39:00,on-call ticket
-INC-1013,srv-2,2026-11-10 12:20:00,2026-11-10 12:25:00,on-call ticket
-INC-1014,srv-5,2026-11-11 09:50:00,2026-11-11 09:51:00,on-call ticket
-INC-1015,srv-4,2026-11-11 14:20:00,2026-11-11 14:23:00,on-call ticket
-INC-1016,srv-1,2026-11-12 10:15:00,2026-11-12 10:24:00,on-call ticket
-INC-1017,srv-3,2026-11-13 11:11:00,2026-11-13 11:13:00,on-call ticket
-INC-1018,srv-3,2026-11-13 15:30:00,2026-11-13 15:35:00,on-call ticket
