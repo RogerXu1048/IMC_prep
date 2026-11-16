@@ -1,0 +1,31 @@
+{
+  "policy": "skip rows with wrong field count, empty symbol, missing/non-numeric/non-positive price; skip blank lines and repeated headers; strip+upper-case symbols; accept thousands separators in quoted prices",
+  "averages": {
+    "AAPL": 101.25,
+    "MSFT": 400.1,
+    "BKNG": 4906.5,
+    "TSLA": 321.25,
+    "SPY": 590.2,
+    "QQQ": 512.4
+  },
+  "sum_cents": {
+    "AAPL": 30375,
+    "MSFT": 40010,
+    "BKNG": 981300,
+    "TSLA": 64250,
+    "SPY": 177060,
+    "QQQ": 51240
+  },
+  "counts": {
+    "AAPL": 3,
+    "MSFT": 1,
+    "BKNG": 2,
+    "TSLA": 2,
+    "SPY": 3,
+    "QQQ": 1
+  },
+  "accepted_rows": 12,
+  "rejected_rows": 8,
+  "blank_lines": 1,
+  "repeated_headers": 1
+}

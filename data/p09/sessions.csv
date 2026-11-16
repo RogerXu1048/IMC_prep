@@ -1,0 +1,5 @@
+session,host,kernel,app_version,tcp_nodelay,so_sndbuf,colo_rack
+s1,oe-host-01,4.18.0-513.el8,oe-2.3.7,1,262144,R12
+s2,oe-host-02,5.14.0-362.el9,oe-2.3.7,1,262144,R07
+s3,oe-host-03,4.18.0-513.el8,oe-2.4.0,0,262144,R07
+s4,oe-host-04,4.18.0-513.el8,oe-2.4.0,1,262144,R07
