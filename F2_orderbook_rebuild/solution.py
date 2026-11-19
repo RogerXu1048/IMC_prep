@@ -1,8 +1,8 @@
 """F2: rebuild an L2 order book from a JSON feed, then describe the market. Run make_data.py first."""
+import heapq
 import json
 import time
 from pathlib import Path
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -11,209 +11,159 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA, PLOTS = ROOT / "data" / "p03", ROOT / "plots"
-REORDER_WINDOW = 20                      # msgs we wait for a hole to fill before declaring a gap
-BBO_COLS = ["bid", "bid_qty", "ask", "ask_qty"]
+COLS = ["bid", "bid_qty", "ask", "ask_qty"]
+ZOOM_S = 3                                     # width of the BBO + trades zoom window (s)
+WAITS_MS = [0, 5, 20, 50, 200]                # reorder-buffer budgets to try (step 5)
+tick = lambda px: round(px * 100)              # DECISION: round, not int(): int(100.12999999999 * 100) = 10012
 
-def to_tick(px: float) -> int:
-    # DECISION: integer ticks as keys. round(), not int(): int(100.12999999999 * 100) = 10012, one tick off
-    return round(px * 100)
+def save(ax, name, title, xlabel, ylabel):
+    ax.set(title=title, xlabel=xlabel, ylabel=ylabel)
+    ax.figure.savefig(PLOTS / f"f2_{name}.png", dpi=110, bbox_inches="tight")
+    plt.close(ax.figure)
 
-def step1_load_and_audit(path: Path) -> list[dict]:
-    msgs, bad_lines = [], 0
-    with open(path) as f:
-        for line in f:                   # DECISION: stream line by line; one bad line must not kill the job
-            try:
-                msgs.append(json.loads(line))
-            except json.JSONDecodeError:
-                bad_lines += 1
-    seqs = pd.Series([m["seq"] for m in msgs if "seq" in m])   # heartbeats carry no seq
-    dup = seqs.duplicated()
-    uniq = seqs[~dup]                    # audit in ARRIVAL order, before deciding any policy
-    late = (uniq < uniq.cummax().shift(fill_value=0)).sum()
-    missing = sorted(set(range(uniq.min(), uniq.max() + 1)) - set(uniq))
-    pxs = [m["px"] for m in msgs if "px" in m]
-    print("STEP 1 audit")
-    print(f"  malformed lines={bad_lines}  types={pd.Series([m.get('type') for m in msgs]).value_counts().to_dict()}")
-    print(f"  duplicates={dup.sum()}  arrived late={late}  missing seqs={missing}")
-    print(f"  prices with float noise={sum(p != round(p, 2) for p in pxs)}, "
-          f"of which int(px*100) is wrong={sum(int(p * 100) != to_tick(p) for p in pxs)}")
+def load():
+    msgs, bad = [], 0
+    for line in open(DATA / "feed.jsonl"):
+        try:
+            msgs.append(json.loads(line))
+        except json.JSONDecodeError:           # DECISION: count and skip a bad line, never crash
+            bad += 1
+    seq = pd.Series([m["seq"] for m in msgs if "seq" in m])        # heartbeats carry no seq
+    u = seq.drop_duplicates()                                       # CHECK: audit in ARRIVAL order, before sorting
+    px = pd.Series([m["px"] for m in msgs if "px" in m])
+    print(f"STEP 1 audit: malformed lines={bad}  types={pd.Series([m['type'] for m in msgs]).value_counts().to_dict()}")
+    print(f"  duplicate seqs={seq.duplicated().sum()}  arrived late={(u.cummax() > u).sum()}  "
+          f"missing seqs={sorted(set(range(1, seq.max() + 1)) - set(seq))}")
+    print(f"  noisy px={(px != px.round(2)).sum()}  int(px*100) wrong={(px * 100).astype(int).ne(tick(px)).sum()}")
     return msgs
 
-class L2Book:
-    """Price-level book: tick -> qty per side, plus a cached best price per side."""
-    def __init__(self) -> None:
-        self.levels: dict[str, dict[int, int]] = {"B": {}, "A": {}}
-        self.best: dict[str, int | None] = {"B": None, "A": None}
-
-    def set(self, side: str, tick: int, qty: int) -> None:
-        lv, best = self.levels[side], self.best[side]
-        if qty > 0:                      # an update carries the NEW absolute size of the level
-            lv[tick] = qty
-            if best is None or (tick > best if side == "B" else tick < best):
-                self.best[side] = tick
-        else:
-            lv.pop(tick, None)
-            if tick == best:             # TRADE-OFF: O(L) rescan only when the best level dies;
-                self.best[side] = (max if side == "B" else min)(lv, default=None)  # sorted tree: O(log L) always
-
-    def reset(self, bids: list, asks: list) -> None:
-        for side, pairs in (("B", bids), ("A", asks)):
-            self.levels[side] = {to_tick(px): q for px, q in pairs if q > 0}
-            self.best[side] = (max if side == "B" else min)(self.levels[side], default=None)
-
-    def bbo(self) -> tuple:
-        b, a = self.best["B"], self.best["A"]
-        return b, self.levels["B"].get(b), a, self.levels["A"].get(a)
-
-class FeedHandler:
-    """Sequencer in front of the book: LIVE -> (hole outlives the reorder window) -> STALE -> snapshot -> LIVE."""
-    def __init__(self) -> None:
-        self.book, self.next_seq, self.pending, self.stale = L2Book(), None, {}, True
-        self.rows, self.trades, self.gaps, self.dups, self.snap_mismatch = [], [], [], 0, 0
-
-    def on_message(self, m: dict) -> None:
-        seq = m.get("seq")
-        if seq is None:
-            return
-        if m["type"] == "snapshot":
-            return self._on_snapshot(m)
-        if self.next_seq is None or seq < self.next_seq or seq in self.pending:
-            self.dups += 1               # duplicate (or before the first snapshot): drop
-            return
-        self.pending[seq] = m            # DECISION: order by exchange seq, never by timestamp
-        self._drain()
-        if self.pending and not self.stale and len(self.pending) > REORDER_WINDOW:
-            self.gaps.append(self.next_seq)   # hole did not fill in time: stop vouching for the book
-            self.stale = True
-
-    def _drain(self) -> None:
-        while self.next_seq in self.pending:
-            m = self.pending.pop(self.next_seq)
-            self.stale = False
-            if m["type"] == "update":
-                self.book.set(m["side"], to_tick(m["px"]), m["qty"])
-            elif m["type"] == "trade":   # a trade print doesn't change L2; the update after it does
-                self.trades.append((m["seq"], m["ts"], to_tick(m["px"]), m["qty"]))
-            self._record(m["seq"], m["ts"])
-            self.next_seq += 1
-
-    def _on_snapshot(self, m: dict) -> None:
-        S = m["seq"]
-        if self.next_seq is not None and S < self.next_seq:
-            return                       # older than what we already applied
-        if self.next_seq == S and not self.stale:   # CHECK: free reconciliation of a live book
-            snap = L2Book()
-            snap.reset(m["bids"], m["asks"])
-            self.snap_mismatch += snap.levels != self.book.levels
-        for s in sorted(k for k in self.pending if k < S):   # superseded by the snapshot -> stale rows
-            old = self.pending.pop(s)
-            if old["type"] == "trade":   # the trade still happened, we just can't say what the book was
-                self.trades.append((s, old["ts"], to_tick(old["px"]), old["qty"]))
-            self.rows.append((s, old["ts"], None, None, None, None, True))
-        self.book.reset(m["bids"], m["asks"])
-        self.stale = False
-        self._record(S, m["ts"])
-        self.next_seq = S + 1
-        self._drain()
-
-    def _record(self, seq: int, ts: int) -> None:
-        b, bq, a, aq = self.book.bbo()
-        assert b is None or a is None or b < a, f"crossed book at seq {seq}"   # CHECK: invariant
-        self.rows.append((seq, ts, b, bq, a, aq, False))
-
-def naive_rebuild(msgs: list[dict]) -> pd.DataFrame:   # arrival order, no dedup/reorder/gap logic
-    book, last = L2Book(), {}
+def replay(msgs):                              # apply msgs in the order given -> one BBO row per msg
+    book, rows, prev, stale = {"B": {}, "A": {}}, [], 0, False
     for m in msgs:
-        if m["type"] == "snapshot":
-            book.reset(m["bids"], m["asks"])
-        elif m["type"] == "update":
-            book.set(m["side"], to_tick(m["px"]), m["qty"])
-        if "seq" in m:
-            last[m["seq"]] = book.bbo()
-    return pd.DataFrame([(s, *v) for s, v in last.items()], columns=["seq", *BBO_COLS])
+        if m["type"] == "snapshot":            # snapshot seq S = book after all seq < S -> full reset
+            book = {"B": {tick(p): q for p, q in m["bids"]}, "A": {tick(p): q for p, q in m["asks"]}}
+        elif m["type"] == "update":            # qty = new absolute size, 0 = delete (trades don't touch the book)
+            if m["qty"] > 0:
+                book[m["side"]][tick(m["px"])] = m["qty"]
+            else:
+                book[m["side"]].pop(tick(m["px"]), None)
+        stale = m["type"] != "snapshot" and (stale or m["seq"] != prev + 1)   # seq gap -> stale until snapshot
+        prev, b, a = m["seq"], max(book["B"]), min(book["A"])   # DECISION: max/min is O(levels); ~50 levels, fine
+        rows.append((m["seq"], m["ts"], b, book["B"][b], a, book["A"][a], stale))
+    return pd.DataFrame(rows, columns=["seq", "ts", *COLS, "stale"]).astype({"ts": "datetime64[ns, UTC]"})
 
-def match_rate(df: pd.DataFrame, truth: pd.DataFrame) -> float:
-    m = df.merge(truth, on="seq", suffixes=("", "_t"))
-    return (m[BBO_COLS].to_numpy() == m[[c + "_t" for c in BBO_COLS]].to_numpy()).all(axis=1).mean()
+def rebuild(msgs):
+    # DECISION: the whole file is on disk, so dedupe by seq and SORT by seq (not ts: many msgs share a ts)
+    ordered = sorted({m["seq"]: m for m in msgs if "seq" in m}.values(), key=lambda m: m["seq"])
+    bbo = replay(ordered)
+    bbo["t"] = (bbo.ts - bbo.ts[0].floor("min")).dt.total_seconds()     # seconds after the 14:30 UTC open
+    truth = pd.read_parquet(DATA / "truth_bbo.parquet").set_index("seq")[COLS] * [100, 1, 100, 1]   # $ -> ticks
+    wrong = lambda df: df.set_index("seq")[COLS].ne(truth.loc[df.seq].round()).any(axis=1).mean()
+    live, st = bbo[~bbo.stale], bbo[bbo.stale]
+    assert (live.bid < live.ask).all()                                  # CHECK: a live book is never crossed
+    naive = replay([m for m in msgs if "seq" in m]).drop_duplicates("seq", keep="last")   # arrival order, no logic
+    rate = bbo.groupby(bbo.t // 1 / 60).size()                          # messages per second, x in minutes
+    ax = rate.plot(figsize=(10, 3.5), lw=0.8)
+    ax.axvspan(st.t.min() / 60, st.t.max() / 60, color="tab:red", alpha=0.3)
+    save(ax, "feed_health", f"Feed is bursty (median {rate.median():.0f}, peak {rate.max()} msgs/s); red = book "
+         f"stale {st.t.max() - st.t.min():.0f} s after a seq gap", "minutes after 14:30 UTC open", "messages / second")
+    trades = pd.DataFrame([(m["seq"], tick(m["px"])) for m in ordered if m["type"] == "trade"], columns=["seq", "px"])
+    return bbo, trades, 1 - wrong(live), wrong(naive), (naive.bid >= naive.ask).sum(), st.t.max() - st.t.min()
 
-def step2_rebuild(msgs: list[dict]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    fh, t0 = FeedHandler(), time.perf_counter()
-    for m in msgs:
-        fh.on_message(m)
-    rate = len(msgs) / (time.perf_counter() - t0)
-    bbo = pd.DataFrame(fh.rows, columns=["seq", "ts", *BBO_COLS, "stale"]).sort_values("seq", ignore_index=True)
-    trades = pd.DataFrame(fh.trades, columns=["seq", "ts", "px", "qty"]).sort_values("seq", ignore_index=True)
-    for df in (bbo, trades):
-        df["ts"] = pd.to_datetime(df["ts"], unit="ns", utc=True)
-    truth = pd.read_parquet(DATA / "truth_bbo.parquet")
-    truth[["bid", "ask"]] = (truth[["bid", "ask"]] * 100).round()   # truth is in $, we work in ticks
-    naive = naive_rebuild(msgs)
-    stale = bbo[bbo.stale]
-    print(f"STEP 2 rebuild ({rate:,.0f} msgs/s)")
-    print(f"  dups dropped={fh.dups}  gap declared at seq {fh.gaps}  snapshot mismatches={fh.snap_mismatch}")
-    print(f"  stale rows={len(stale)} (seq {stale.seq.min()}..{stale.seq.max()})")
-    print(f"  live rows matching truth: {match_rate(bbo[~bbo.stale], truth):.2%}")
-    print(f"  naive arrival-order rebuild: {1 - match_rate(naive, truth):.2%} rows wrong, "
-          f"crossed rows={(naive.bid >= naive.ask).sum()}")
-    return bbo, trades
-
-def step3_stats(bbo: pd.DataFrame, trades: pd.DataFrame) -> pd.DataFrame:
-    # time weight = how long each BBO state lasted; 0 if the next row is stale (we don't know)
-    next_live = ~bbo.stale.shift(-1, fill_value=True)
-    bbo = bbo.assign(dur_s=(bbo.ts.shift(-1) - bbo.ts).dt.total_seconds().where(next_live, 0.0))
-    live = bbo[~bbo.stale]
-    spread = live.ask - live.bid
-    # quote rule: compare the price with the mid just before the trade (row at the trade's seq)
-    t = trades.merge(bbo[["seq", "bid", "ask"]], on="seq")
-    t["sign"] = np.sign(2 * t.px - (t.bid + t.ask))
-    tick_rule = np.sign(t.px.diff()).replace(0, np.nan).ffill()
-    t["sign"] = t.sign.where(t.sign.fillna(0) != 0, tick_rule)       # at the mid or stale -> tick rule
+def market(bbo, trades):
+    live = bbo.assign(dur_s=bbo.t.diff().shift(-1).fillna(0),            # dur_s = how long this BBO state lasted
+                      spread=bbo.ask - bbo.bid)[~bbo.stale]
+    tr = trades.merge(live[["seq", "t", "bid", "ask"]], on="seq")       # DECISION: row at trade seq = book BEFORE it
+    tr["side"] = np.sign(2 * tr.px - tr.bid - tr.ask)                   # quote rule: above mid = buyer-initiated
     truth = pd.read_parquet(DATA / "truth_trades.parquet")
-    acc = (t.merge(truth, on="seq").pipe(lambda d: d.sign == np.where(d.aggressor == "B", 1, -1))).mean()
-    print("STEP 3 stats")
-    print(f"  spread (ticks): event-weighted={spread.mean():.2f}  time-weighted={np.average(spread, weights=live.dur_s):.2f}")
-    print(f"  trades={len(t):,}  VWAP=${(t.px * t.qty).sum() / t.qty.sum() / 100:.4f}  sign accuracy={acc:.1%}")
-    start = t.ts.dt.floor("1min").value_counts().idxmax()            # busiest minute by trade count
-    w, wt = (d[d.ts.between(start, start + pd.Timedelta("1min"))] for d in (live, t))
-    fig, ax = plt.subplots(figsize=(11, 4))
-    for col in ("bid", "ask"):
-        ax.step(w.ts, w[col] / 100, where="post", label=f"best {col}")
-    for s, c, name in ((1, "green", "buy-initiated"), (-1, "red", "sell-initiated")):
-        ax.scatter(wt.ts[wt.sign == s], wt.px[wt.sign == s] / 100, s=8, c=c, label=name, zorder=3)
-    ax.set(title=f"BBO and trades, busiest minute {start:%H:%M} UTC", ylabel="price ($)")
-    ax.legend(fontsize=8)
-    fig.savefig(PLOTS / "f2_bbo_trades.png", dpi=110, bbox_inches="tight")
-    plt.close(fig)
-    return live
+    acc = tr.merge(truth, on="seq").pipe(lambda d: d.side == d.aggressor.map({"B": 1, "S": -1})).mean()
+    start = (tr.t // ZOOM_S * ZOOM_S).value_counts().idxmax()           # busiest window by trade count
+    w, wt = (d[d.t.between(start, start + ZOOM_S)] for d in (live, tr))
+    ax = (w.set_index(w.t - start)[["bid", "ask"]] / 100).plot(drawstyle="steps-post", figsize=(10, 4))
+    for s, mk, name in ((1, "^", "buyer-initiated trade"), (-1, "v", "seller-initiated trade")):
+        ax.scatter(wt.t[wt.side == s] - start, wt.px[wt.side == s] / 100, marker=mk, s=25, c="k", label=name, zorder=3)
+    ax.legend(fontsize=8, loc="upper left")
+    save(ax, "bbo_trades", f"Busiest {ZOOM_S} s: buys print at the ask, sells at the bid",
+         f"seconds after {w.ts.iloc[0]:%H:%M:%S} UTC", "price ($)")
+    s = live.spread.clip(upper=5).astype(str).replace("5", "5+")
+    pct = pd.DataFrame({"% of book updates": s.value_counts(normalize=True),
+                        "% of time": live.dur_s.groupby(s).sum() / live.dur_s.sum()}).sort_index() * 100
+    ax = pct.plot.bar(rot=0, figsize=(7, 4), color=["#b4b3ad", "tab:blue"])
+    save(ax, "spread_dist", f"1-tick spread {pct.iloc[0, 1]:.0f}% of the time but only {pct.iloc[0, 0]:.0f}% "
+         "of updates: wide spreads close fast", "spread (ticks)", "share (%)")
+    return live, live.spread.mean(), np.average(live.spread, weights=live.dur_s), len(tr), acc
 
-def step4_imbalance(live: pd.DataFrame) -> None:
-    move = (live.bid + live.ask).diff().shift(-1)                    # 2*mid change to the next row
-    df = pd.DataFrame({
-        "imb": (live.bid_qty - live.ask_qty) / (live.bid_qty + live.ask_qty),
-        "next": np.sign(move.where(move != 0).bfill()),              # sign of the NEXT non-zero mid move
-    }).dropna()
+def imbalance(live):
+    nxt = (live.bid + live.ask).diff().shift(-1).replace(0, np.nan).bfill()   # DECISION: NEXT non-zero mid move
+    imb = (live.bid_qty - live.ask_qty) / (live.bid_qty + live.ask_qty)
+    df = pd.DataFrame({"imb": imb, "up": nxt > 0})[nxt.notna()]
     train, test = df.iloc[: len(df) // 2], df.iloc[len(df) // 2:]
-    # DECISION: decile edges from the first half only -> no look-ahead into the test half
-    edges = np.unique(np.r_[-np.inf, np.quantile(train.imb, np.linspace(0.1, 0.9, 9)), np.inf])
-    table = pd.DataFrame({name: d.groupby(pd.cut(d.imb, edges, labels=False)).next.apply(lambda s: (s > 0).mean())
-                          for name, d in (("first_half", train), ("second_half", test))})
-    nz = test[test.imb != 0]
-    print("STEP 4 imbalance -> P(next mid move is up), by decile")
-    print(table.round(2).T.to_string())
-    print(f"  out of sample: sign(imbalance) gets the next move right {(np.sign(nz.imb) == nz.next).mean():.1%}")
-    fig, ax = plt.subplots(figsize=(7, 4))
-    table.plot(ax=ax, marker="o")
-    ax.axhline(0.5, color="grey", ls="--")
-    ax.set(xlabel="top-of-book imbalance decile (0 = ask-heavy)", ylabel="P(next mid move up)")
-    fig.savefig(PLOTS / "f2_imbalance_deciles.png", dpi=110, bbox_inches="tight")
-    plt.close(fig)
+    edges = np.r_[-1, np.quantile(train.imb, np.linspace(0.1, 0.9, 9)), 1]   # DECISION: deciles from 1st half only
+    p_up = lambda d: d.groupby(pd.cut(d.imb, edges, labels=False, include_lowest=True)).up.mean() * 100
+    table = pd.DataFrame({"first half (deciles fit here)": p_up(train), "second half (out of sample)": p_up(test)})
+    ax = table.plot(marker="o", figsize=(7, 4), xticks=range(10))
+    ax.axhline(50, color="grey", ls="--", lw=1)
+    save(ax, "imbalance_deciles", "Bid-heavy books tick up next, and it holds out of sample",
+         "top-of-book imbalance decile (0 = ask-heavy, 9 = bid-heavy)", "P(next mid move is up) (%)")
+    return table, ((test.imb > 0) == test.up)[test.imb != 0].mean()
 
-def main() -> None:
+def live_order(msgs, wait_ms):
+    """STEP 5 live mode: we can't sort a file we don't have yet. Release msgs in seq order, hold early ones in a
+    heap, and give up on a missing seq once the oldest held msg has waited wait_ms (clock = newest ts seen)."""
+    # Production: NIC thread -> lock-free SPSC ring -> this loop on one pinned thread per book (single writer, no locks)
+    heap, out, held, nxt, now = [], [], [], 1, 0         # timeout is checked on each arrival (live: also a timer)
+    for j, m in enumerate(m for m in msgs if "seq" in m):
+        now = max(now, m["ts"])
+        if m["seq"] >= nxt:                                   # else: duplicate, or too late (we gave up on it)
+            heapq.heappush(heap, (m["seq"], j, now, m))       # j (arrival no.) breaks ties between duplicates
+        while heap and (heap[0][0] <= nxt or now - min(h[2] for h in heap) >= wait_ms * 1e6):   # heap stays tiny
+            seq, i, t0, m2 = heapq.heappop(heap)
+            if seq >= nxt:                                    # seq > nxt: timed out, skip the gap -> book goes stale
+                out.append(m2), held.append((j > i, (now - t0) / 1e6))   # (had to wait?, how long in ms)
+                nxt = seq + 1
+    return out, np.array(held)
+
+def live_mode(msgs, bbo):
+    ref, rows, speed = bbo.set_index("seq")[COLS], [], []     # the offline book, verified vs truth in step 2
+    for w in WAITS_MS:
+        t = time.perf_counter()
+        out, held = live_order(msgs, w)
+        b = replay(out)
+        speed.append(len(out) / (time.perf_counter() - t))    # buffer + book, one thread, pure Python
+        lv = b[~b.stale]
+        assert not lv.set_index("seq")[COLS].ne(ref.loc[lv.seq]).any(axis=None)   # CHECK: stale, but never wrong
+        stale_s = b.ts.diff().shift(-1).dt.total_seconds()[b.stale].sum()
+        rows.append((w, stale_s, held[:, 0].mean() * 100, held[:, 1].max()))
+    table = pd.DataFrame(rows, columns=["wait_ms", "stale_s", "held_%", "max_hold_ms"]).set_index("wait_ms")
+    pick = table.index[table.stale_s <= table.stale_s.min() + 1][0]   # smallest budget that is as good as offline
+    return table, pick, min(speed), min(speed) / bbo.groupby(bbo.t // 1).size().max()
+
+def main():
     PLOTS.mkdir(parents=True, exist_ok=True)
-    msgs = step1_load_and_audit(DATA / "feed.jsonl")
-    bbo, trades = step2_rebuild(msgs)
-    live = step3_stats(bbo, trades)
-    step4_imbalance(live)
+    msgs = load()
+    bbo, trades, ok, bad, crossed, stale_s = rebuild(msgs)
+    print(f"STEP 2 rebuild: stale rows={bbo.stale.sum():,}  live rows matching truth={ok:.2%}\n"
+          f"  naive arrival-order replay: {bad:.2%} rows wrong, {crossed:,} crossed")
+    live, ev, tw, n, acc = market(bbo, trades)
+    print(f"STEP 3 market: spread event-weighted={ev:.2f} ticks, time-weighted={tw:.2f} ticks\n"
+          f"  quote rule vs truth_trades: {acc:.1%} right on {n:,} live trades")
+    table, oos = imbalance(live)
+    print(f"STEP 4 imbalance: P(next mid move up) by decile, %\n{table.round().astype(int).T.to_string()}\n"
+          f"  out of sample, sign(imbalance) calls the next move {oos:.1%}")
+    buf, pick, speed, headroom = live_mode(msgs, bbo)
+    print(f"STEP 5 live: reorder-buffer budget vs staleness vs added delay\n{buf.round(2).to_string()}\n"
+          f"  smallest budget as good as offline: {pick} ms | {speed:,.0f} msgs/s = {headroom:,.0f}x the peak second")
+    print("CONCLUSION",
+          f"- Book = exchange BBO on {ok:.2%} of live rows; naive arrival order: {bad:.2%} wrong, {crossed:,} crossed",
+          f"- Spread {tw:.2f} ticks per unit time vs {ev:.2f} per update: wide spreads come in bursts and close fast",
+          f"- Imbalance calls the next mid move {oos:.0%} of the time out of sample (coin flip = 50%)",
+          f"- Live: a {pick} ms reorder buffer is as good as sorting ({buf['held_%'].iloc[-1]:.1f}% of msgs wait); 0 ms "
+          f"leaves the book stale {buf.stale_s.iloc[0]:,.0f} of 1,800 s", sep="\n")
+    print("LIMITATIONS",
+          f"- A real gap still costs {stale_s:.0f} s until the next snapshot (ask for a retransmit); "
+          f"the {pick} ms budget is fit on one session",
+          "- Quote rule is exact only because every trade prints at the touch; real feeds have hidden/midpoint fills",
+          "- Next-move direction is not P&L (spread, latency, queue position); one synthetic 30-min session", sep="\n")
 
 if __name__ == "__main__":
     main()

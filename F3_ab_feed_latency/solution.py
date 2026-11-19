@@ -1,6 +1,4 @@
-"""F3 -- A/B feed: integrity, latency, arbitration, "did the B upgrade help?"  Run after make_data.py"""
-import heapq
-from itertools import repeat
+"""F3: one multicast feed captured on line A and line B over two days. Did the line-B upgrade help?"""
 from pathlib import Path
 
 import matplotlib
@@ -9,207 +7,114 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-HERE = Path(__file__).resolve().parent
-DATA, PLOTS = HERE.parent / "data" / "p04", HERE.parent / "plots"
-LINES = ("A", "B")
-QS = [0.5, 0.9, 0.99, 0.999]
-RATE_WINDOW_NS = 100_000       # load proxy = msgs the exchange sent in the previous 100 us
-RATE_BUCKETS = [0, 25, 50, 75, 100, 150, 1_000]
-GAP_TIMEOUT_NS = 100_000       # how long the live arbiter waits for the other line
-WIRE_OVERHEAD_B = 62           # Ethernet/IP/UDP headers (42) + preamble & inter-frame gap (20)
+DATA, PLOTS = [Path(__file__).resolve().parent.parent / p for p in ("data/p04", "plots")]
+BEFORE, AFTER = "2026-11-10", "2026-11-11"     # line-B switch upgraded overnight in between
+WINDOW_NS = 100_000                             # load = msgs the exchange sent in the previous 100 us
+BUCKETS = [0, 25, 50, 75, 100, 150, 1_000]      # load buckets, msgs per 100 us
+COLOR, DASH = {"A": "#2a78d6", "B": "#eb6834"}, {BEFORE: "--", AFTER: "-"}
+plt.rcParams.update({"savefig.bbox": "tight", "axes.grid": True, "axes.axisbelow": True, "grid.alpha": 0.3})
 
+def load():
+    df = pd.concat([pd.read_parquet(DATA / f"feed_{l}.parquet").assign(line=l) for l in "AB"],
+                   ignore_index=True)
+    df["date"] = df["date"].astype(str)
+    df["dup"] = df.duplicated(["line", "date", "seq"])
+    # CHECK: rows are in arrival order, so a seq below the running max arrived out of order
+    df["ooo"] = (df["seq"] < df.groupby(["line", "date"])["seq"].cummax()) & ~df["dup"]
+    print(df.groupby(["line", "date"]).agg(rows=("seq", "size"), dups=("dup", "sum"), ooo=("ooo", "sum")))
+    df = df.loc[~df["dup"], ["line", "date", "seq", "exch_ns", "rx_ns"]]    # DECISION: keep 1st copy
+    return df.assign(lat_us=(df["rx_ns"] - df["exch_ns"]) / 1e3)
 
-def runs(seqs: list[int]) -> int:
-    """Number of runs of consecutive seqs -- tells clustered loss from random loss."""
-    return 0 if not seqs else int(1 + (np.diff(seqs) != 1).sum())
+def step1_audit(df):
+    # LIMITATION: only gaps between received seqs count; a loss at the very start/end is invisible
+    s = df.sort_values(["line", "date", "seq"])
+    s["gap"] = s.groupby(["line", "date"])["seq"].diff() - 1      # seqs missing just before this one
+    audit = s[s["gap"] > 0].groupby(["line", "date"])["gap"].agg(missing="sum", runs="size").astype(int)
+    audit["pct"] = 100 * audit["missing"] / (s.groupby(["line", "date"]).size() + audit["missing"])
+    audit["mean_run"] = audit["missing"] / audit["runs"]           # ~1 = random, >1 = clustered
+    both = df.groupby("date")["seq"].max() - df.drop_duplicates(["date", "seq"]).groupby("date").size()
+    # CHECK: how slow were the packets B lost, measured on line A? Random loss would look typical
+    only_a = (df.groupby(["date", "seq"])["line"].transform("size") == 1) & (df["line"] == "A")
+    return audit.round(3), both, df.loc[only_a, "lat_us"].median()
 
-
-def step1_load_and_check() -> tuple[dict[str, pd.DataFrame], dict[str, list[int]]]:
-    feeds, report = {}, []
-    for line in LINES:
-        raw = pd.read_parquet(DATA / f"feed_{line}.parquet")     # one row per packet, arrival order
-        raw["date"] = raw["date"].astype(str)
-        raw["dup"] = raw.duplicated(["date", "seq"])
-        # DECISION: keep the first copy of a duplicated seq -- the second copy adds nothing
-        df = raw[~raw["dup"]].copy()
-        # CHECK: rows are in arrival order, so a seq below the running max arrived out of order
-        df["ooo"] = df["seq"] < df.groupby("date")["seq"].cummax()
-        # DECISION: day-relative ns. Epoch ns (~1.8e18) > 2**53, so if a merge turns int64 into
-        # float64 we would silently lose 256 ns of resolution.
-        day0 = pd.to_datetime(df["date"]).astype("datetime64[ns]").astype("int64")
-        df["exch"], df["rx"] = df["exch_ns"] - day0, df["rx_ns"] - day0
-        df["lat_us"] = (df["rx_ns"] - df["exch_ns"]) / 1e3
-        feeds[line] = df
-        counts = raw.groupby("date").agg(packets=("seq", "size"), dups=("dup", "sum"))
-        report.append(counts.join(df.groupby("date")["ooo"].sum()).assign(line=line))
-    report = pd.concat(report).reset_index().set_index(["line", "date"])
-
-    both_lost = {}
-    for date in sorted(feeds["A"]["date"].unique()):
-        got = {l: set(feeds[l].loc[feeds[l]["date"] == date, "seq"]) for l in LINES}
-        # TRADE-OFF: the universe is 1..max seen seq; a loss at the very end of the day is invisible
-        universe = set(range(1, max(max(s) for s in got.values()) + 1))
-        for l in LINES:
-            lost = sorted(universe - got[l])
-            report.loc[(l, date), ["lost", "lost_pct", "mean_run"]] = [
-                len(lost), 100 * len(lost) / len(universe), len(lost) / max(runs(lost), 1)]
-        both_lost[date] = sorted((universe - got["A"]) & (universe - got["B"]))
-    print(report.round(3).to_string())
-    for date, seqs in both_lost.items():
-        print(f"{date}: {len(seqs)} seqs in {runs(seqs)} runs lost on BOTH lines -> need retransmission")
-    return feeds, both_lost
-
-
-def step2_latency(feeds: dict[str, pd.DataFrame]) -> None:
-    lat = pd.concat([f.assign(line=l) for l, f in feeds.items()], ignore_index=True)
-    print(lat.groupby(["line", "date"])["lat_us"].quantile(QS).unstack().round(1).to_string())
-    # CHECK: rx - exch mixes two clocks. The per-minute MINIMUM strips queueing; if it drifts the
-    # same way on two independent lines, the drift is the clock offset, not the network.
-    lat["minute"] = lat["exch"] // 60_000_000_000
-    mins = lat.groupby(["line", "date", "minute"])["lat_us"].min().reset_index()
-    for (line, date), g in mins.groupby(["line", "date"]):
-        slope = np.polyfit(g["minute"], g["lat_us"], 1)[0] * 60
-        print(f"  {line} {date}: per-minute minimum drifts {slope:+.2f} us/hour")
-
+def step2_latency(df):
+    pct = df.groupby(["line", "date"])["lat_us"].agg(p50="median", p99=lambda s: s.quantile(0.99))
+    # CHECK: per-minute MIN strips queueing; same drift on both lines = clock offset, not network
+    mins = df.groupby(["line", "date", df["exch_ns"] // 60_000_000_000])["lat_us"].min()
+    pct["min_drift_us_per_h"] = mins.groupby(level=[0, 1]).agg(lambda m: 60 * np.polyfit(range(len(m)), m, 1)[0])
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    for (line, date), g in lat.groupby(["line", "date"]):
+    for (line, date), g in df.groupby(["line", "date"]):
         x = np.sort(g["lat_us"].to_numpy())
-        ax.plot(x, 1 - np.arange(len(x)) / len(x), label=f"line {line} {date}")
-    ax.set(xscale="log", yscale="log", xlabel="rx - exch (us)", ylabel="P(latency > x)",
-           title="Per-line latency tail (CCDF, log-log)")
-    ax.legend()
-    fig.savefig(PLOTS / "f3_latency_ccdf.png", dpi=110, bbox_inches="tight")
-    plt.close(fig)
+        ax.plot(x, 100 * (1 - np.arange(len(x)) / len(x)), c=COLOR[line], ls=DASH[date], label=f"{line} {date}")
+    ax.set(xscale="log", yscale="log", xlim=(20, 900), ylim=(0.01, 100), xlabel="latency rx - exch (us, log)",
+           ylabel="% of packets slower than x (log)", title="Tails got fatter on BOTH lines on busy 11-11")
+    ax.set_xticks([20, 50, 100, 200, 500], ["20", "50", "100", "200", "500"])
+    ax.set_yticks([100, 10, 1, 0.1, 0.01], ["100%", "10%", "1%", "0.1%", "0.01%"])
+    ax.legend(title="line, date")
+    fig.savefig(PLOTS / "f3_latency_tail.png")
+    return pct.round(2)
 
+def step3_upgrade(df):
+    # DECISION: load from the union of both lines, so B's own losses can't hide B's busy periods
+    u = df.drop_duplicates(["date", "seq"]).sort_values("exch_ns")
+    u["load"] = np.arange(len(u)) - np.searchsorted(u["exch_ns"], u["exch_ns"] - WINDOW_NS, side="right") + 1
+    df = df.merge(u[["date", "seq", "load"]], on=["date", "seq"])
+    naive = df.groupby(["date", "line"])["lat_us"].quantile(0.99).unstack()
+    naive["busy_pct"] = 100 * (u["load"] >= 100).groupby(u["date"]).mean()    # the confounder
+    # DECISION: pair the SAME packet on both lines: traffic, exchange and our clock cancel out
+    a, b = (df[df["line"] == l] for l in "AB")
+    p = a.merge(b[["date", "seq", "exch_ns", "rx_ns"]], on=["date", "seq"], suffixes=("", "_B"))
+    assert (p["exch_ns"] == p["exch_ns_B"]).all()          # CHECK: identical packets on both lines
+    p["b_minus_a_us"] = (p["rx_ns_B"] - p["rx_ns"]) / 1e3
+    paired = p.groupby("date")["b_minus_a_us"].agg(median="median", b_first_pct=lambda s: 100 * (s < 0).mean())
+    p["bucket"] = pd.cut(p["load"], BUCKETS, right=False)
+    by_load = p.groupby(["bucket", "date"], observed=True)["b_minus_a_us"].median().unstack()
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    by_load.plot.bar(ax=ax, rot=0, color=["#9e9e9e", COLOR["B"]], width=0.75)
+    ax.axhline(0, color="k", lw=0.8)
+    ax.set(xlabel="load bucket (msgs the exchange sent in the previous 100 us)", ylabel="median B - A (us)",
+           title="Same packets: B was slower than A before, faster after, at every load")
+    fig.savefig(PLOTS / "f3_paired_by_load.png")
+    return df, naive.round(1), paired.round(2), by_load.round(2)
 
-def step3_arbitrate(feeds: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    cols = ["date", "seq", "exch", "rx"]
-    m = feeds["A"][cols].merge(feeds["B"][cols], on=["date", "seq"], how="outer", suffixes=("_A", "_B"))
-    same = m.dropna(subset=["exch_A", "exch_B"])
-    assert (same["exch_A"] == same["exch_B"]).all(), "A and B must carry identical packets"
-    m["exch"] = m["exch_A"].fillna(m["exch_B"])
-    # DECISION: first arrival wins; min() skips NaN, so a line that lost the packet never wins
-    m["rx_arb"] = m[["rx_A", "rx_B"]].min(axis=1)
-    m["winner"] = np.select([m["rx_B"].isna(), m["rx_A"].isna(), m["rx_A"] <= m["rx_B"]],
-                            ["A only", "B only", "A"], "B")
-    for c in ("A", "B", "arb"):
-        m[f"lat_{c}"] = (m[f"rx_{c}"] - m["exch"]) / 1e3
-    print((pd.crosstab(m["date"], m["winner"], normalize="index") * 100).round(2).to_string())
-    print(m.groupby("date")[["lat_A", "lat_B", "lat_arb"]].quantile([0.5, 0.99, 0.999]).round(1).to_string())
-    # CHECK: survivorship -- if B only drops packets stuck in deep queues, B-alone p99 looks too good
-    lost_b = m["rx_B"].isna() & m["rx_A"].notna()
-    print(f"line-A latency of packets that B lost: median {m.loc[lost_b, 'lat_A'].median():.0f} us "
-          f"(all packets: {m['lat_A'].median():.0f} us) -> B drops inside microbursts")
-    return m
+def step4_load_effect(df):
+    load_bin = df["load"].clip(upper=160) // 10 * 10                    # last bin = 160+
+    curve = df.groupby(["line", "date", load_bin])["lat_us"].median().unstack(["line", "date"])
+    # DECISION: knee = first load bin whose median is > 3 us above that curve's idle (load < 10)
+    knee = (curve > curve.iloc[0] + 3).idxmax()
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for (line, date), m in curve.items():
+        ax.plot(m.index, m, marker="o", ms=3, c=COLOR[line], ls=DASH[date], label=f"{line} {date}")
+    ax.axvspan(knee.min(), knee.max(), color="grey", alpha=0.2, label="knee")
+    ax.set(xlabel="load (msgs sent in the previous 100 us; last bin = 160+)", ylabel="median latency (us)",
+           title=f"Flat until ~{knee.min()}-{knee.max()} msgs/100us, then queues build on both lines")
+    ax.legend(title="line, date")
+    fig.savefig(PLOTS / "f3_latency_vs_load.png")
+    return knee
 
-
-def step3b_live_arbiter(feeds: dict[str, pd.DataFrame], date: str) -> tuple[dict, list]:
-    """What the feed handler runs online: O(1) amortised per packet, publishes in seq order."""
-    a, b = (feeds[l][feeds[l]["date"] == date] for l in LINES)
-    arrivals = heapq.merge(zip(a["rx"].tolist(), a["seq"].tolist(), repeat("A")),
-                           zip(b["rx"].tolist(), b["seq"].tolist(), repeat("B")))
-    next_seq, pending, wins, gaps = 1, {}, {"A": 0, "B": 0}, []
-    for rx, seq, line in arrivals:                 # the order the NIC sees them
-        if seq < next_seq or seq in pending:
-            continue                               # other line already delivered it
-        wins[line] += 1
-        pending[seq] = rx
-        while pending:
-            if next_seq in pending:                # publish downstream, strictly in order
-                del pending[next_seq]
-                next_seq += 1
-            elif rx - min(pending.values()) > GAP_TIMEOUT_NS:
-                # TRADE-OFF: longer timeout = fewer false gaps but a book frozen for longer
-                first = min(pending)
-                gaps.append((next_seq, first - 1))  # both lines lost it -> request retransmission
-                next_seq = first
-            else:
-                break
-    return wins, gaps
-
-
-def step4_upgrade(m: pd.DataFrame, mean_bytes: float) -> dict:
-    m = m.sort_values(["date", "exch"])
-    # DECISION: load from the UNION of both lines, so one line's own losses can't bias its load
-    # two pointers, vectorised: index of the first msg inside the window via binary search
-    m["rate"] = m.groupby("date")["exch"].transform(
-        lambda e: np.arange(len(e)) - np.searchsorted(e, e - RATE_WINDOW_NS, side="right") + 1)
-    d1, d2 = sorted(m["date"].unique())
-
-    naive = m.groupby("date")[["lat_A", "lat_B"]].quantile([0.5, 0.99]).unstack().round(1)
-    print("naive day-over-day (us):\n" + naive.to_string())
-    burst_share = (m["rate"] >= 100).groupby(m["date"]).mean() * 100
-    print(f"msgs sent at >=100 msgs/100us: {burst_share[d1]:.1f}% on {d1} vs {burst_share[d2]:.1f}% on {d2}")
-
-    # DECISION: paired comparison -- the SAME packet on both lines cancels traffic, exchange and clock
-    m["bucket"] = pd.cut(m["rate"], RATE_BUCKETS, right=False)
-    both = m.dropna(subset=["lat_A", "lat_B"])
-    diff = both["lat_B"] - both["lat_A"]
-    by_load = diff.groupby([both["bucket"], both["date"]], observed=True).median().unstack()
-    print("paired median(B - A) by load bucket (us, <0 = B faster):\n" + by_load.round(2).to_string())
-    paired = diff.groupby(both["date"]).median()
-
-    long = m.melt(id_vars=["date", "rate"], value_vars=["lat_A", "lat_B"],
-                  var_name="line", value_name="lat").dropna()
-    long["rbin"] = np.minimum(long["rate"] // 5 * 5, 200)      # last bin = 200+
-    curve = long.groupby(["line", "date", "rbin"])["lat"].agg(
-        p50="median", p99=lambda s: s.quantile(0.99), n="size")
-    curve = curve[curve["n"] >= 200]
-    # Knee: first load bin from which line A's median (unchanged hardware) stays > idle + 2 us
-    a = long[long["line"] == "lat_A"].groupby("rbin")["lat"].median()
-    above = a > a.iloc[:2].mean() + 2
-    knee = int(a.index[a.index > a.index[~above].max()].min())
-    capacity = 100_000 / ((mean_bytes + WIRE_OVERHEAD_B) * 8)     # 1 Gb/s = 8 ns per byte
-    print(f"knee ~{knee} msgs/100us; 1G link capacity ~{capacity:.0f} msgs/100us "
-          f"-> queueing starts at ~{100 * knee / capacity:.0f}% utilisation")
-
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-    for (line, date), g in curve.groupby(level=[0, 1]):
-        x = g.index.get_level_values("rbin")
-        p50 = ax.plot(x, g["p50"], label=f"line {line[-1]} {date}")[0]
-        ax.plot(x, g["p99"], ls="--", c=p50.get_color())
-    ax.axvline(knee, c="grey", lw=0.8)
-    ax.set(yscale="log", xlabel="msgs sent in previous 100 us", ylabel="latency (us)",
-           title="Latency vs load: p50 solid, p99 dashed, grey = knee")
-    ax.legend()
-    fig.savefig(PLOTS / "f3_latency_vs_rate.png", dpi=110, bbox_inches="tight")
-    plt.close(fig)
-    return dict(d1=d1, d2=d2, naive=naive, paired=paired, knee=knee, capacity=capacity,
-                burst_share=burst_share)
-
-
-def step5_conclusion(m: pd.DataFrame, r: dict, n_both_lost: int) -> None:
-    d1, d2, p99, paired = r["d1"], r["d2"], r["naive"][("lat_B", 0.99)], r["paired"]
-    b_wins = (m.loc[m["date"] == d2, "winner"] == "B").mean()
-    print(f"- Upgrade works: B now wins {b_wins:.0%} of races; on the same packets B vs A moved "
-          f"{paired[d1]:+.1f} -> {paired[d2]:+.1f} us, in every load bucket.")
-    print(f"- B's naive p99 rose {p99[d1]:.0f} -> {p99[d2]:.0f} us only because {d2} had "
-          f"{r['burst_share'][d2] / r['burst_share'][d1]:.1f}x more microburst traffic (unchanged A rose too).")
-    print(f"- Both lines queue above ~{r['knee']} msgs/100us (~{100 * r['knee'] / r['capacity']:.0f}% of 1G): "
-          f"the tail needs bandwidth, not a faster switch.")
-    print(f"- {n_both_lost} seqs were lost on both lines: retransmission/snapshot recovery must stay healthy.")
-
-
-def main() -> None:
+def main():
     PLOTS.mkdir(exist_ok=True)
-    print("== Step 1: integrity per line and day")
-    feeds, both_lost = step1_load_and_check()
-    print("\n== Step 2: per-line latency (rx - exch, us)")
-    step2_latency(feeds)
-    print("\n== Step 3: A/B arbitration (winner share %, then latency percentiles)")
-    m = step3_arbitrate(feeds)
-    for date in sorted(both_lost):
-        wins, gaps = step3b_live_arbiter(feeds, date)
-        n_gap = sum(hi - lo + 1 for lo, hi in gaps)
-        print(f"live arbiter {date}: wins {dict(wins)}, {len(gaps)} gaps / {n_gap} seqs declared")
-        # CHECK: the online arbiter must agree with the offline merge (winners and gaps)
-        offline = m.loc[m["date"] == date, "winner"].str[0].value_counts().to_dict()  # "A only" -> A
-        assert wins == offline and n_gap == len(both_lost[date])
-    print("\n== Step 4: did the line-B upgrade help?")
-    r = step4_upgrade(m, feeds["A"]["bytes"].mean())
-    print("\n== Step 5: conclusion for the network team")
-    step5_conclusion(m, r, sum(len(s) for s in both_lost.values()))
-
+    print("== DATA QUALITY | rows, duplicates, out-of-order arrivals")
+    df = load()
+    audit, both, lost_b = step1_audit(df)
+    print(f"\n== STEP 1 | missing seqs\n{audit}\nlost on BOTH lines: {both.to_dict()}; seqs B lost had "
+          f"line-A latency median {lost_b:.0f} us (all packets: {df['lat_us'].median():.0f} us)")
+    print(f"\n== STEP 2 | latency rx - exch (us), drift of per-minute minimum\n{step2_latency(df)}")
+    df, naive, paired, by_load = step3_upgrade(df)
+    print(f"\n== STEP 3 | naive p99 (us); busy_pct = % msgs at >= 100 msgs/100us\n{naive}\n"
+          f"paired B - A on the same packet (us)\n{paired}\nmedian B - A by load bucket (us)\n{by_load}")
+    knee = step4_load_effect(df)
+    print(f"\n== STEP 4 | knee (msgs/100us) per line/day\n{knee.unstack()}")
+    d, bf, n = paired["median"], paired["b_first_pct"], naive
+    print(f"\nCONCLUSION\n- Upgrade helped: same-packet B - A went {d[BEFORE]:+.1f} -> {d[AFTER]:+.1f} us at "
+          f"every load; B arrives first on {bf[BEFORE]:.0f}% -> {bf[AFTER]:.0f}% of packets.")
+    print(f"- B's naive p99 rose {n.loc[BEFORE, 'B']} -> {n.loc[AFTER, 'B']} us because {AFTER} was busier "
+          f"(busy_pct {n.loc[BEFORE, 'busy_pct']} -> {n.loc[AFTER, 'busy_pct']}); untouched A rose too.")
+    print(f"- The tail is load: both lines queue above ~{knee.min()}-{knee.max()} msgs/100us, B drops "
+          f"packets in bursts, and {both.sum()} seqs lost on both lines need retransmission.")
+    print("\nLIMITATIONS\n- Only two days; load is measured, not controlled (other overnight changes?)."
+          "\n- rx - exch mixes two clocks (minimum drifts ~1 us/h on both lines): trust same-packet B - A."
+          "\n- Paired stats skip the packets B lost, and those were B's slowest ones (survivor bias).")
 
 if __name__ == "__main__":
     main()

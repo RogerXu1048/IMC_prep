@@ -1,194 +1,163 @@
-#!/usr/bin/env python3
-"""F1 — order processing latency from gateway logs.  Run: python3 make_data.py && python3 solution.py"""
-from __future__ import annotations
-
+"""F1 -- order latency from gateway logs.  Run: python3 make_data.py && python3 solution.py"""
+import math
 import re
-from collections import Counter
-from datetime import datetime, timezone
-from functools import lru_cache
+import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Iterator
-
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
-LOG_PATH = ROOT / "data" / "p01" / "gateway.log"
-PLOTS = ROOT / "plots"
-NS_PER_US, NS_PER_S = 1_000, 1_000_000_000
-LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})\.(\d{6}|\d{9}) (gw-\d+) (\w+)\s+\[t\d+\] (.*)$")
-CONTINUATION_RE = re.compile(r"^(\s|Traceback|[\w.]+: )")      # traceback lines under an ERROR line
-REQUIRED = {("IN", "NewOrder"): {"clid", "qty"}, ("IN", "Cancel"): {"clid", "sym"},
-            ("OUT", "NewOrder"): {"clid", "venue"}, ("OUT", "Cancel"): {"clid", "venue"},
-            ("ACK", None): {"clid", "exch_id"}, ("REJ", None): {"clid", "reason"}}
-VENUES = {"XNAS", "ARCX", "BATS"}
-COLS = ["ts_ns", "gw", "ev", "mtype", "clid", "venue", "reason"]
-OPEN_WINDOW = ("14:30:00", "14:30:29")       # US cash open = 14:30 UTC in November
-SLOW_US = 500                                # "obviously slow" for a ~8 us process
-CLUSTER_GAP_S = 5                            # no-response orders > 5 s apart = separate incidents
+LOG, PLOTS = ROOT / "data" / "p01" / "gateway.log", ROOT / "plots"
+# One regex per order-event line, anchored at both ends, so a line cut short by log rotation fails to match.
+EVENT_RE = re.compile(r"^\S+ (\d\d):(\d\d):(\d\d)\.(\d{6}|\d{9}) (gw-\d) +\w+ +\[t\d\] (IN|OUT|ACK|REJ) +"
+                      r"(?:(NewOrder|Cancel) )?clid=(\S+) (?:venue=(XNAS|ARCX|BATS)|reason=([A-Z_]+)|.*=\w+)$")
+NS, MS, SLOW_US, CYCLE_S = 10**9, 10**6, 500, 10   # SLOW: normal < ~30 us, slow 1-4 ms; CYCLE: CHECKed in step 4
+TICKS = [1, 3, 10, 30, 100, 300, 1000, 3000]
+PER_DEC, NB = 50, 200                                  # step 5: 50 log bins per decade, 1 us .. 10 ms (~5% wide)
+hms = lambda ns: pd.Timestamp(int(ns)).strftime("%H:%M:%S")      # ns since midnight -> "HH:MM:SS"
+to_ns = lambda h, mi, s, frac: ((int(h) * 60 + int(mi)) * 60 + int(s)) * NS + int(frac.ljust(9, "0"))
 
 
-# ---------------------------------------------------------------- step 1: parse
-@lru_cache(maxsize=None)
-def epoch_s(date: str, hms: str) -> int:
-    # DECISION: cache per second -- 15 min of logs has only ~900 distinct seconds and strptime is slow.
-    return int(datetime.strptime(f"{date} {hms}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp())
-
-
-def parse_lines(path: Path, dq: Counter) -> Iterator[tuple]:
-    # DECISION: generator -> O(1) memory per line; the production log is ~200 GB/day.
-    with open(path, encoding="utf-8", errors="replace") as f:
+def load():
+    rows, dq = [], dict.fromkeys(["malformed", "traceback", "ERROR", "HB/stats"], 0)
+    with open(LOG) as f:
         for line in f:
-            dq["lines"] += 1
-            m = LINE_RE.match(line.rstrip("\n"))
-            if m is None:
-                dq["traceback" if CONTINUATION_RE.match(line) else "malformed"] += 1
-                continue
-            date, hms, frac, gw, level, body = m.groups()
-            tokens = body.split()                 # TRADE-OFF: split is faster than one big regex, less strict
-            ev = tokens[0]
-            if ev not in ("IN", "OUT", "ACK", "REJ"):
-                dq["error_lines" if level == "ERROR" else "heartbeat_stats"] += 1
-                continue
-            mtype = tokens[1] if ev in ("IN", "OUT") else None
-            kv = dict(t.split("=", 1) for t in tokens if "=" in t)
-            # CHECK: a truncated line loses its last field(s) -> drop it rather than trust half a record.
-            if not REQUIRED.get((ev, mtype), {"?"}) <= kv.keys() or (ev == "OUT" and kv["venue"] not in VENUES):
+            if m := EVENT_RE.match(line):
+                rows.append((to_ns(*m.groups()[:4]), *m.groups()[4:]))   # DECISION: int ns, us padded. Never float.
+            elif not line[:1].isdigit():       # indented lines under an ERROR
+                dq["traceback"] += 1
+            elif " ERROR " in line:
+                dq["ERROR"] += 1
+            elif " HB " in line or "session stats" in line:
+                dq["HB/stats"] += 1
+            else:                              # truncated line: drop it rather than trust half a record
                 dq["malformed"] += 1
-                continue
-            # DECISION: normalise 6-digit (us) and 9-digit (ns) fractions to integer ns, never floats.
-            frac_ns = int(frac) if len(frac) == 9 else int(frac) * NS_PER_US
-            dq["events"] += 1
-            yield epoch_s(date, hms) * NS_PER_S + frac_ns, gw, ev, mtype, kv["clid"], kv.get("venue"), kv.get("reason")
+    ev = pd.DataFrame(rows, columns=["ts", "gw", "ev", "mtype", "clid", "venue", "reason"])
+    back, dup = -np.diff(ev.ts), ev.duplicated()   # back > 0: a line older than the one before it
+    print(f"STEP 1 audit: {len(ev) + sum(dq.values())} lines -> {len(ev)} order events | skipped {dq}\n  dropped "
+          f"{dup.sum()} exact duplicates | kept {(back > 0).sum()} out-of-order lines (<= {back.max() / MS:.1f} ms "
+          f"back; we pair by clid) | ns timestamps: {sorted(ev.gw[ev.ts % 1000 != 0].unique())}")
+    return ev[~dup]
 
 
-def step1_parse(path: Path = LOG_PATH) -> tuple[pd.DataFrame, Counter]:
-    dq: Counter = Counter()
-    ev = pd.DataFrame.from_records(parse_lines(path, dq), columns=COLS)
-    dq["out_of_order"] = int((np.diff(ev.ts_ns.to_numpy()) < 0).sum())   # multi-threaded logger
-    dup = ev.duplicated(["gw", "clid", "ev", "ts_ns"])                    # logger retried a write
-    dq["duplicates"] = int(dup.sum())
-    # CHECK: keep timestamps as Int64 -- epoch-ns in float64 only resolves ~256 ns.
-    return ev[~dup].astype({"ts_ns": "Int64"}), dq
-
-
-# ---------------------------------------------------------------- step 2: one row per order
-def step2_orders(ev: pd.DataFrame) -> pd.DataFrame:
-    # DECISION: pair by clid (a hash join), never by file order -- lines are out of order.
-    t = ev.groupby(["clid", "ev"]).ts_ns.min().unstack().reindex(columns=["IN", "OUT", "ACK", "REJ"])
-    o = t.join(ev.groupby("clid")[["gw", "mtype", "venue", "reason"]].first())   # first non-null
-    o["status"] = np.select([o.IN.isna(), o.OUT.isna(), o.ACK.notna(), o.REJ.notna()],
-                            ["INCOMPLETE_LOG", "NOT_SENT", "ACKED", "REJECTED"], "NO_RESPONSE")
-    o["internal_us"] = ((o.OUT - o.IN) / NS_PER_US).astype(float)          # time inside our gateway
-    o["rtt_us"] = ((o.ACK.fillna(o.REJ) - o.OUT) / NS_PER_US).astype(float)  # network + exchange
-    o["t_out"] = pd.to_datetime(o.OUT, unit="ns", utc=True)
-    # CHECK: a negative latency would mean a pairing or clock bug.
-    assert not ((o.internal_us < 0) | (o.rtt_us < 0)).any()
+def per_order(ev):
+    # DECISION: pair by clid, never by file order. Int64 keeps ns exact where an event is missing (float would not).
+    t = ev.astype({"ts": "Int64"}).pivot_table(index="clid", columns="ev", values="ts", aggfunc="min")
+    o = t.join(ev.groupby("clid")[["gw", "mtype", "venue", "reason"]].first())
+    o["internal_us"] = ((o.OUT - o.IN) / 1e3).astype(float)            # inside our gateway, one host clock
+    o["rtt_us"] = ((o.ACK.fillna(o.REJ) - o.OUT) / 1e3).astype(float)  # wire + venue
+    o["status"] = np.select([o.ACK.notna(), o.REJ.notna(), o.OUT.isna()], ["acked", "rejected", "not sent"],
+                            default="no response")
+    assert not ((o.internal_us < 0) | (o.rtt_us < 0)).any()             # CHECK: negative = pairing/clock bug
     return o
 
 
-# ---------------------------------------------------------------- step 3: statistics
-def pct(s: pd.Series) -> pd.Series:
-    s = s.dropna()
-    q = s.quantile([0.5, 0.99, 0.999])
-    return pd.Series({"count": len(s), "mean": s.mean(), "p50": q[0.5], "p99": q[0.99],
-                      "p99.9": q[0.999], "max": s.max()})
-
-
-def step3_stats(o: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    internal = o.dropna(subset=["internal_us"]).groupby(["gw", "mtype"]).internal_us.apply(pct).unstack()
-    acked = o[o.status == "ACKED"]
-    # DECISION: split the open burst out -- 5x message rate, a different regime, not "normal" RTT.
-    period = np.where(acked.t_out.dt.strftime("%H:%M:%S").between(*OPEN_WINDOW), "open", "normal")
-    rtt = acked.groupby(["venue", period]).rtt_us.apply(pct).unstack()
-    return internal.round(1), rtt.round(1)
-
-
-# ---------------------------------------------------------------- step 4: diagnose
-def step4_diagnose(o: pd.DataFrame) -> dict:
+def stats(o):
     sent = o.dropna(subset=["internal_us"])
+    g = sent.groupby(["gw", "mtype"]).internal_us
+    internal = g.quantile([0.5, 0.99]).unstack().assign(mean=g.mean()).round(1)
+    per_s = (o.OUT.dropna() // NS).value_counts()                    # orders sent in each second
+    burst = per_s[per_s > 3 * per_s.median()]   # DECISION: split out this burst (the confounder). CHECK: = US open?
+    acked = o[o.status == "acked"]
+    g = acked.groupby(["venue", np.where((acked.OUT // NS).isin(burst.index), "open", "normal")]).rtt_us
+    rtt = g.quantile([0.5, 0.99]).unstack().assign(n=g.count()).round(1)
     p99 = sent.groupby("gw").internal_us.quantile(0.99)
-    worst = p99.idxmax()
-    w = sent[sent.gw == worst]
-    t_in = w.IN.astype("int64")
-    slow = w.internal_us > SLOW_US
-    # DECISION: period = most common gap (s) between seconds that contain slow orders.
-    period_s = int(pd.Series(np.diff(np.unique(t_in[slow] // NS_PER_S))).mode()[0])
-    phase_ms = (t_in % (period_s * NS_PER_S)) / 1e6
-    in_window = phase_ms <= phase_ms[slow].max()
-
-    nr = o[o.status == "NO_RESPONSE"].sort_values("OUT")
-    cluster_id = (nr.OUT.diff() > CLUSTER_GAP_S * NS_PER_S).cumsum()    # gap-based clustering
-    clusters = nr.groupby(cluster_id).agg(n=("venue", "size"), start=("t_out", "min"), end=("t_out", "max"),
-                                          venue=("venue", lambda v: v.value_counts().idxmax()))
-    rate_limit = o[o.reason == "RATE_LIMIT"]
-
-    fig, ax = plt.subplots(1, 3, figsize=(16, 4.5))
-    for gw, g in sent.groupby("gw"):
-        x = np.sort(g.internal_us.to_numpy())
-        ax[0].step(x, 1 - np.arange(len(x)) / len(x), where="post", label=gw)
-    ax[0].set(xscale="log", yscale="log", xlabel="internal latency (us)", ylabel="P(latency > x)",
-              title="tail by gateway")
-    ax[0].legend()
-    ax[1].scatter(phase_ms, w.internal_us, s=2)
-    ax[1].set(yscale="log", xlabel=f"ms into each {period_s}s cycle", title=f"{worst}: folded by time")
-    pd.crosstab(nr.t_out.dt.floor("5s"), nr.venue).plot(ax=ax[2], marker="o", lw=0,
-                                                        title="no-response orders per 5 s")
-    fig.tight_layout()
-    fig.savefig(PLOTS / "f1_diagnosis.png", dpi=110)
-    plt.close(fig)
-    return {"p99_by_gw": p99.round(1).to_dict(), "worst": worst, "slow_share": slow.mean(),
-            "period_s": period_s, "slow_phase_ms": (phase_ms[slow].min(), phase_ms[slow].max()),
-            "worst_p99_outside_window": w.internal_us[~in_window].quantile(0.99),
-            "no_response": len(nr), "clusters": clusters[clusters.n >= 10],
-            "rate_limit_by_gw": rate_limit.gw.value_counts().to_dict(),
-            "rate_limit_window": (rate_limit.t_out.min(), rate_limit.t_out.max())}
+    fig, ax = plt.subplots(figsize=(7.5, 4.2))
+    for gw, x in sent.groupby("gw").internal_us:                      # 1 - ECDF on log-log shows the tail
+        ax.step(np.sort(x), 1 - np.arange(len(x)) / len(x), where="post", label=gw)
+    ax.set(xscale="log", yscale="log", xlabel="internal latency IN->OUT (µs, log)", ylabel="share of orders slower",
+           title=f"{p99.idxmax()}: same median, but p99 = {p99.max():.0f} µs vs ~{p99.median():.0f} µs elsewhere")
+    ax.set_xticks(TICKS, TICKS), ax.set_yticks([1, 0.1, 0.01, 1e-3, 1e-4], ["100%", "10%", "1%", "0.1%", "0.01%"])
+    ax.minorticks_off(), ax.legend(), fig.tight_layout(), fig.savefig(PLOTS / "f1_latency_tail.png", dpi=110)
+    return internal, rtt, burst, per_s.median(), p99
 
 
-# ---------------------------------------------------------------- step 5: scale (mergeable p99)
-def step5_merge_p99(o: pd.DataFrame) -> tuple[float, float, float]:
-    # DECISION: each shard ships a log-bucket histogram (HDR-style); merging = adding counts.
-    # TRADE-OFF: bucket width (~2.3%) bounds the quantile error, memory is O(#buckets) not O(#orders).
-    sent = o.dropna(subset=["internal_us"])
-    bins = np.logspace(0, 5, 501)                                    # 1 us .. 100 ms
-    merged = sum(np.histogram(g.internal_us, bins)[0] for _, g in sent.groupby("gw"))
-    merged_p99 = bins[np.searchsorted(np.cumsum(merged) / merged.sum(), 0.99) + 1]
-    wrong_avg = sent.groupby("gw").internal_us.quantile(0.99).mean()  # percentiles don't average
-    return sent.internal_us.quantile(0.99), merged_p99, wrong_avg
+def diagnose(o, worst):
+    w = o[(o.gw == worst) & o.internal_us.notna()].assign(t=lambda d: d.IN.astype("int64"))
+    phase_ms, slow = (w.t % (CYCLE_S * NS)) / MS, w.internal_us > SLOW_US      # phase = ms into the cycle
+    stall_ms = phase_ms[slow].max()
+    nr = o[o.status == "no response"].assign(t=lambda d: d.OUT.astype("int64")).sort_values("t")
+    nr["incident"] = (nr.t.diff() > 5 * NS).cumsum()                   # DECISION: a > 5 s gap starts a new incident
+    big, rl = nr[nr.groupby("incident").t.transform("size") >= 10], o[o.reason == "RATE_LIMIT"]
+    top = big.venue.value_counts()
+    r = dict(worst=worst, slow_pct=100 * slow.mean(), stall_ms=stall_ms, n_nr=len(nr), n_big=len(big),
+             gap_s=pd.Series(np.diff(np.unique(w.t[slow] // NS))).mode()[0],   # CHECK: should equal CYCLE_S
+             clean_p99=w.internal_us[phase_ms > stall_ms].quantile(0.99), venues=top.to_dict(), venue=top.index[0],
+             n_venue=top.iloc[0], n_gw=big.gw.nunique(), start=hms(big.t.min()), secs=(big.t.max() - big.t.min()) / NS,
+             rl_gw=rl.gw.value_counts().to_dict(), rl_when=f"{hms(rl.OUT.min())}-{hms(rl.OUT.max())}")
+    fig, ax = plt.subplots(1, 2, figsize=(14, 4.3))
+    ax[0].scatter(phase_ms, w.internal_us, s=2, alpha=0.2, rasterized=True)
+    ax[0].set(yscale="log", xlabel=f"ms into each {CYCLE_S} s cycle", ylabel="internal latency (µs, log)",
+              title=f"{worst}: every order > {SLOW_US} µs is in the first {stall_ms:.0f} ms of a {CYCLE_S} s cycle")
+    ax[0].set_yticks(TICKS, TICKS), ax[0].minorticks_off()
+    ax[1].scatter(pd.to_datetime(nr.t), nr.venue, marker="|", s=300, alpha=0.4)   # one tick per unanswered order
+    ax[1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    ax[1].set(xlabel="time the order was sent (UTC)", ylabel="venue",
+              title="{venue}: {n_venue} orders got no answer in {secs:.0f} s from {start}".format(**r))
+    fig.tight_layout(), fig.savefig(PLOTS / "f1_diagnosis.png", dpi=110)
+    return r
 
 
-def main() -> None:
-    pd.set_option("display.width", 140)
+def gw_hist(gw):
+    """STEP 5 worker: stream ONE gateway's lines. Memory = open orders + NB counters, not the whole file."""
+    open_, h = {}, np.zeros(NB, int)
+    with open(LOG) as f:                     # here all gateways share one file; in production each has its own
+        for line in f:
+            if f" {gw} " in line and (m := EVENT_RE.match(line)) and m[6] in ("IN", "OUT"):  # cheap test first
+                ts, ev, clid = to_ns(*m.groups()[:4]), m[6], m[8]
+                first = open_.setdefault(clid, (ev, ts))     # OUT can be logged before IN: keep whichever is first
+                if first[0] != ev:                           # pair complete -> one sample, free the memory
+                    us = (ts - first[1] if ev == "OUT" else first[1] - ts) / 1e3
+                    h[min(max(int(PER_DEC * math.log10(max(us, 1))), 0), NB - 1)] += 1   # O(1) log bin
+                    del open_[clid]
+    return h, len(open_)                     # left open: never sent, or a duplicate line after the pair closed
+
+
+def scale_out(o):
+    """STEP 5: 200 GB/day won't fit in a DataFrame. One worker per gateway file; each returns a tiny histogram."""
+    t, gws = time.perf_counter(), sorted(o.gw.unique())
+    with ProcessPoolExecutor() as ex:        # DECISION: processes, not threads: regex parsing is CPU-bound (GIL)
+        res = dict(zip(gws, ex.map(gw_hist, gws)))
+    p99 = lambda h: 10 ** ((np.searchsorted(np.cumsum(h), 0.99 * h.sum()) + 1) / PER_DEC)   # bin's upper edge
+    merged = sum(h for h, _ in res.values())   # DECISION: ship histograms and ADD them; p99s cannot be averaged
+    assert merged.sum() == o.internal_us.notna().sum()                 # CHECK: streaming pairs = step-2 pairs
+    return dict(wall_s=time.perf_counter() - t, merged=p99(merged), exact=o.internal_us.quantile(0.99), n=merged.sum(),
+                avg=np.mean([p99(h) for h, _ in res.values()]), left=sum(n for _, n in res.values()))
+
+
+def main():
     PLOTS.mkdir(exist_ok=True)
-    ev, dq = step1_parse()
-    print("== step 1: data quality ==", dict(dq))
-    print("gateways logging ns timestamps:", sorted(ev.loc[ev.ts_ns % NS_PER_US != 0, "gw"].unique()))
-
-    o = step2_orders(ev)
-    print("\n== step 2: orders by status ==", o.status.value_counts().to_dict())
-
-    internal, rtt = step3_stats(o)
-    print("\n== step 3: internal latency IN->OUT (us) ==\n", internal)
-    print("\n== step 3: venue RTT OUT->ACK (us) ==\n", rtt)
-    g3 = o.loc[o.gw == "gw-3", "internal_us"]
-    print(f"gw-3 mean={g3.mean():.1f}us vs median={g3.median():.1f}us -> the mean is driven by the tail")
-
-    d = step4_diagnose(o)
-    print("\n== step 4: diagnosis ==")
-    print("p99 internal by gateway (us):", d["p99_by_gw"])
-    print(f"{d['worst']}: {d['slow_share']:.2%} of orders > {SLOW_US}us; period = {d['period_s']}s; "
-          f"slow orders sit {d['slow_phase_ms'][0]:.0f}-{d['slow_phase_ms'][1]:.0f} ms into each cycle; "
-          f"p99 outside that window = {d['worst_p99_outside_window']:.1f}us")
-    print(f"no-response orders: {d['no_response']}; clusters of >= 10:\n{d['clusters'].to_string(index=False)}")
-    print(f"RATE_LIMIT rejects by gw: {d['rate_limit_by_gw']}, "
-          f"{d['rate_limit_window'][0]:%H:%M:%S}-{d['rate_limit_window'][1]:%H:%M:%S}")
-
-    exact, merged, wrong = step5_merge_p99(o)
-    print(f"\n== step 5: global p99 exact={exact:.1f}us, merged histograms={merged:.1f}us, "
-          f"WRONG average of per-gateway p99s={wrong:.1f}us")
+    t = time.perf_counter()
+    o = per_order(load())
+    parse_s = time.perf_counter() - t
+    print("\nSTEP 2 orders by status:", o.status.value_counts().to_dict())
+    internal, rtt, burst, base, p99 = stats(o)
+    print(f"\nSTEP 3 internal latency IN->OUT (us):\n{internal}\n  venue round trip OUT->ACK (us), open burst "
+          f"{hms(burst.index.min() * NS)}-{hms(burst.index.max() * NS)} ({burst.mean():.0f}/s vs {base:.0f}/s):\n{rtt}")
+    r = diagnose(o, p99.idxmax())
+    print("\nSTEP 4 stall: {worst} has {slow_pct:.2f}% of orders > 500 us, every {gap_s} s, all in the first "
+          "{stall_ms:.0f} ms of the cycle; p99 outside it {clean_p99:.1f} us\n  no response: {n_nr} orders; {n_big} in "
+          "{secs:.0f} s from {start}: {venues} from {n_gw} gateways\n  RATE_LIMIT: {rl_gw}, {rl_when}".format(**r))
+    s = scale_out(o)
+    print("\nSTEP 5 scale: 1 process parsed + paired in {p:.1f} s; {w} streaming processes took {wall_s:.1f} s\n"
+          "  overall p99: merged histogram <= {merged:.1f} us (exact {exact:.1f} us, {n:,} orders); averaging the "
+          "gateway p99s says {avg:.0f} us -- wrong\n  left open at the end: {left} (evict after a TTL in production)"
+          .format(**s, p=parse_s, w=o.gw.nunique()))
+    p50 = internal[0.5].groupby(level="mtype").median()
+    print("\nCONCLUSION\n - Typical internal latency: {NewOrder:.0f} us NewOrder / {Cancel:.0f} us Cancel on all four;"
+          " quote p50 + p99 per gateway, not a mean.\n - {worst} stalls ~{stall_ms:.0f} ms every {gap_s} s; outside the"
+          " stall its p99 is {clean_p99:.0f} us like the rest. A periodic job on that host?\n - {venue} went silent at "
+          "{start}: {n_venue} orders in unknown state (reconcile, don't resend). {rl_top} hit RATE_LIMIT at the open.\n"
+          " - Fleet scale: stream each gateway, ship a histogram, add them (p99 {merged:.0f} us); never average p99s "
+          "({avg:.0f} us).".format(**r, **p50, **s, rl_top=list(r["rl_gw"])[0]))
+    print("LIMITATIONS\n - One 15-minute window on one day: the 10 s cycle and the venue gap need more days to confirm."
+          "\n - Log time is when a line was written, not when the event happened. IN->OUT is same-host; cross-host "
+          "needs PTP.\n - The stall's cause is inferred from timing, not proven: check that host's cron and perf data.")
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
-# F1 — Order Processing Latency from Gateway Logs
+# F1 — Order Latency from Gateway Logs
 
-**Time box: ~2 hours** · Python, pandas, matplotlib (the interviewer will help with syntax)
+**Time box: ~2 hours (aim for ~100 lines of core code).** Python, pandas, matplotlib; the interviewer will help with syntax.
 
 ## Context
-Our strategies send orders through four order gateways (`gw-1` … `gw-4`). A gateway receives an order (`IN`), sends it to an exchange (`OUT`), and then gets the exchange's answer (`ACK` = accepted, `REJ` = rejected). The trading desk asks: *"What is our average order processing time, and is anything wrong?"* You have 15 minutes of raw, multi-threaded gateway logs around the US open (14:30 UTC). Real logs are never perfectly clean.
+Our strategies send orders through four order gateways (`gw-1` … `gw-4`): a gateway receives an order (`IN`), sends it to an exchange (`OUT`), then gets the exchange's answer (`ACK` = accepted, `REJ` = rejected). The trading desk asks: *"What is our average order processing time, and is anything wrong?"* You have 15 minutes of raw, multi-threaded gateway logs around the US cash open (14:30 UTC). Real logs are never perfectly clean.
 
 ## Data
 Run `python3 make_data.py` first. It writes `../data/p01/gateway.log` (~274k lines). Typical lines:
@@ -16,28 +16,27 @@ Run `python3 make_data.py` first. It writes `../data/p01/gateway.log` (~274k lin
 ```
 | field | meaning |
 |---|---|
-| timestamp | UTC time the line was logged on the gateway host (fractional seconds) |
+| timestamp | UTC time the line was written on the gateway host (fractional seconds) |
 | gateway / level / thread | `gw-1..4` / `DEBUG INFO WARN ERROR` / `[t1..t4]` |
 | event | `IN` from strategy · `OUT` to exchange · `ACK` accepted · `REJ` rejected |
 | msg type | `NewOrder` or `Cancel` (on `IN` / `OUT` lines only) |
 | `clid` | client order id, unique per order |
-| `venue` | `XNAS`, `ARCX`, `BATS` (on `OUT`) |
-| `reason` / `exch_id` | reject reason (`REJ`) / exchange order id (`ACK`) |
+| `venue` / `reason` / `exch_id` | `XNAS ARCX BATS` (on `OUT`) / reject reason (on `REJ`) / exchange order id (on `ACK`) |
 
-The file also contains heartbeats, stats lines, errors with tracebacks, and other things a real log contains. Don't assume every line is well-formed.
+The file also contains heartbeats, stats lines and errors with tracebacks. Don't assume every line is well-formed.
 
 ## Steps
-1. **Parse.** Stream the file, as if it didn't fit in memory, into a DataFrame with one row per order event. Deliverable: a data-quality summary (lines parsed / skipped / malformed / duplicated / out of time order) and how you handled each case.
-2. **One row per order.** Pair each order's events. Compute `internal latency = OUT − IN` and `venue round trip = (ACK or REJ) − OUT`, and give every order a status. Deliverable: the per-order table and a status count. State how you treat missing, duplicated or impossible timestamps.
-3. **Statistics.** Deliverable: a table of count / mean / p50 / p99 / p99.9 / max for internal latency by gateway × msg type, and for round trip by venue. Then answer the desk: what is "the" average processing time, and is the mean the right number to report?
-4. **Diagnose.** If a gateway or venue behaves differently, find *when* and *why*. Deliverable: one figure that makes the root cause obvious to an engineer, plus one or two sentences per finding. Also look at orders that never received an answer, and at the rejects.
-5. **Scale (discussion; a little code if time allows).** Production logs are ~200 GB/day across 40 gateways. How would you compute the same numbers daily, or in real time, and combine the 40 machines' results?
+1. **Load and audit.** Parse the file into one row per order event. Deliverable: a data-quality summary: each kind of problem you found, how many lines it affects, and what you did about it.
+2. **One row per order.** Compute `internal latency = OUT − IN` and `venue round trip = (ACK or REJ) − OUT`, and give every order a status. Deliverable: the per-order table and a count by status.
+3. **Statistics.** Deliverable: p50 / p99 / mean of internal latency by gateway, and of round trip by venue. Make sure every comparison is fair. Then answer the desk: what is "the" processing time, and is the mean the right number to report?
+4. **Diagnose.** If a gateway or venue behaves differently, find *when* and *why*. Also look at orders that never got an answer, and at the rejects. Deliverable: 2–3 figures whose titles state the takeaway, plus one or two sentences per finding.
+5. **Scale (optional, ~15 min, or talk it through).** Production logs are ~200 GB/day from 40 gateways. Rework the parser so its memory doesn't grow with the file, process the gateways in parallel, and combine their latency distributions into one fleet-wide p99. Deliverable: the fleet p99, checked against Step 3; what you get if you average the per-gateway p99s instead; and whether the parallel version was actually faster.
 
-## Discussion / follow-ups
-1. Each gateway reports its own p99. Can you average the 40 p99s? What do you ship to the central node instead?
-2. IN/OUT/ACK are all timestamped on the gateway host. Which latencies can you trust? What changes when two timestamps come from different machines (NTP vs PTP)?
-3. One gateway logs nanoseconds and the others log microseconds. What does 1 µs resolution do to a 5–8 µs measurement?
-4. An order never got an ACK or REJ. Can the system just resend it? What should happen instead?
-5. What is the memory complexity of your parser and pairing? What state does a fully streaming version need?
-6. How fast is your parser (lines/s)? How would you find where the time goes, and make it faster or concurrent?
-7. How would you alert on these problems in real time without paging people for every outlier?
+**Wrap-up: 2 minutes, your conclusion + limitations.**
+
+## Follow-up questions
+1. IN, OUT and ACK are all timestamped on the gateway host. Which latencies can you trust? What changes if two timestamps come from different machines?
+2. What does the timestamp resolution do to a measurement of a few microseconds?
+3. An order never got an ACK or REJ. Can the system just resend it? What should happen instead?
+4. Threads or processes for the parser, and why? When would the parallel version *not* be faster?
+5. How would you alert on these problems in real time without paging on every outlier?
