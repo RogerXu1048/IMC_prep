@@ -108,7 +108,7 @@ same_mix = by_venue.mul(mix.S1, axis=0).sum()
 
 ## 7. 图怎么讲
 - **(a) `f4_daily_hit_rate.png`**：时间序列 + CI band，是决定"能不能 pool"的第一张图。"Each line is one venue's daily hit rate with a 95% band; the day-11 jump and the day-16 cliff are far outside the bands, so I never pool across them."
-- **(b) `f4_race_curve.png`**：分箱条件均值是"比例 vs 连续变量"最直观的画法。注意 EX5 前两个点之间的长直线：S1 快、S2 慢，latency 是双峰，中间没有数据，不要解读那段斜率。"Moving right means we are slower; every venue falls, and how early it falls shows how fast the competition is: EX1 first, EX5 last."
+- **(b) `f4_race_curve.png`**：分箱条件均值是"比例 vs 连续变量"最直观的画法。S1 快、S2 慢，所以 latency 是双峰，中间一段没有数据。相邻两个点的 latency 差超过 30% 时就把线断开（no data, no line），否则一条长直线会暗示那段的形状。"Moving right means we are slower; every venue falls, and how early it falls shows how fast the competition is: EX1 first, EX5 last."
 - **(c) `f4_s1_vs_s2.png`**：grouped bars 把每个 venue 和 pooled 放在一起，paradox 一眼可见。"S1 beats S2 on every venue, yet the pooled pair on the right flips, because 85% of S2's attempts sit on EX5, the easiest venue."
 
 ## 8. 结论与 limitations（英文 script，2 分钟）

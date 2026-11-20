@@ -8,6 +8,7 @@
 - 每道题的核心是 4 个 Step。2 小时内写出约 **100–120 行**清晰、能跑、验证过的核心代码，再花 2 分钟讲清楚**结论和 limitations**。
 - F1 和 F2 另有一个加分的 **Step 5**（缓冲、优化、并发，约 35 行）：有时间就写，没时间就照 guide 口头讲。
 - 每个 `solution.py` 最后都会打印 CONCLUSION 和 LIMITATIONS，照着练讲法。
+- **答题模版和 5 张题卡**（澄清、拆 block、每块用什么方法和函数、trade-off、收尾话术）：[INTERVIEW_PLAYBOOK.md](INTERVIEW_PLAYBOOK.md)。
 - 常见追问和 2–3 句的答法：[INTERVIEW_QA.md](INTERVIEW_QA.md)。
 
 ## 5 道题，按练习价值排序
@@ -56,7 +57,7 @@
 
 **有余力再做**：F5（约 1 h，重点是两张图和机制解释）。
 
-**面试前 30 min**：PLOT_GUIDE §3–5（checklist、常见坑、英文句式）、每道题 guide.md 里的"结论与 limitations"，再过一遍 [INTERVIEW_QA.md](INTERVIEW_QA.md)。
+**面试前 30 min**：先过 [INTERVIEW_PLAYBOOK.md](INTERVIEW_PLAYBOOK.md) 第 1 部分的模版和各题卡的"报"，再看 PLOT_GUIDE §3–5（checklist、常见坑、英文句式），最后过一遍 [INTERVIEW_QA.md](INTERVIEW_QA.md)。
 
 > **如果今天就要 mock**：先花 20 分钟读 MOCK.md 的 B 部分，再在 `F2_orderbook_rebuild/` 里运行一次 `python3 solution.py`，把 4 张图看熟。
 

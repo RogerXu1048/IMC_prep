@@ -69,7 +69,11 @@ def step3_race_curve(df, n_bins=10):
     c = d.groupby(["venue", "bin"]).agg(us=("reaction_us", "median"), hit=("hit", "mean"), n=("hit", "size"))
     fig, ax = plt.subplots(figsize=(9, 4.5), layout="constrained")
     for v, g in c.groupby(level="venue"):   # LIMITATION: pools S1+S2 and all edge sizes -> not causal
-        ax.errorbar(g.us, g.hit, yerr=1.96 * np.sqrt(g.hit * (1 - g.hit) / g.n), marker="o", ms=4, capsize=2, label=v)
+        eb = ax.errorbar(g.us, g.hit, yerr=1.96 * np.sqrt(g.hit * (1 - g.hit) / g.n), marker="o", ms=4, capsize=2,
+                         ls="none", label=v)
+        gap = np.sqrt(g.us * g.us.shift())[g.us > 1.3 * g.us.shift()]     # middle of a jump with no data in it
+        line = g.set_index("us").hit.reindex(np.sort(np.r_[g.us, gap]))   # NaN there: no data, no line
+        ax.plot(line.index, line, color=eb[0].get_color())
     ax.set_xscale("log")
     ax.set_xticks([0.8, 1, 1.5, 2, 3, 4], ["0.8", "1", "1.5", "2", "3", "4"])
     ax.minorticks_off()                 # otherwise log minor ticks get "6x10^-1"-style labels

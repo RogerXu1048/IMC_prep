@@ -159,7 +159,7 @@ to_ns = lambda h, mi, s, frac: ((int(h) * 60 + int(mi)) * 60 + int(s)) * NS + in
 > "On this file, four processes weren't faster than one, because process start-up and re-reading a shared 24 MB file dominate. With one file per gateway and gigabytes in each, the work per process dwarfs the start-up, so it would scale with cores. I'd measure that rather than assume it."
 
 ## 图怎么讲
-**图 1 `f1_latency_tail.png`：按 gateway 的 1 − ECDF（log-log）。** 为什么：要比较 4 个完整分布，而且重点在尾部；4 个 histogram 叠在一起会互相遮挡，1% 的尾巴在线性轴上也看不见。log y 把 1%、0.1% 拉开。
+**图 1 `f1_latency_tail.png`：按 gateway 的 1 − ECDF（log-log）。** 为什么：要比较 4 个完整分布，而且重点在尾部；4 个 histogram 叠在一起会互相遮挡，1% 的尾巴在线性轴上也看不见。log y 把 1%、0.1% 拉开。标题里的 p99（1241 µs）是 NewOrder 和 Cancel 合在一起算的；Step 3 的表按类型拆开，gw-3 NewOrder 的 p99 是 1368 µs，两者不矛盾，被问到要能说清。
 > "The four curves overlap down to about 1%, then gw-3 flattens out into milliseconds: same typical latency, very different tail."
 
 **图 2 左 `f1_diagnosis.png`：gw-3 延迟 vs 周期内的 ms（散点，log y）。** 为什么：按怀疑的周期折叠时间，"随机"的尖峰就变成一根柱子；每个点是一单，能直接看出"每一个"慢单都在窗口里。
